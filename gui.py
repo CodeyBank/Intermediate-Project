@@ -11,6 +11,7 @@ import lifi_pb2
 import io
 import PIL.Image as Image
 import bson
+import serial.tools.list_ports
 
 mainApp, _ = loadUiType('gui_main.ui')
 
@@ -26,23 +27,26 @@ class ReceiverWorker(QtCore.QThread):
     def run(self):
         while True:
             data = self.txRxObj.readall()
+            print(data)
             if data:
                 tReceived = time.time()
                 self.done.emit(True)
-                val = bson.decode(data)
-                tSent = val['timestamp']
-                msg = val['message']
-                msgSize = val['messageSize']
-                transmitTime = tReceived - tSent
+                try:
+                    val = bson.decode(data)
+                    tSent = val['timestamp']
+                    msg = val['message']
+                    msgSize = val['messageSize']
+                    transmitTime = tReceived - tSent
 
-                tmp = "\n\nTransmission time: {} seconds \nBytes sent: {}".format(transmitTime, msgSize)
-                output = "\n************New data received*********\n" + msg + tmp
-                self.message.emit(output)
-                print(val)
+                    tmp = "\n\nTransmission time: {} seconds \nBytes sent: {}".format(transmitTime, msgSize)
+                    output = "\n************New data received*********\n" + msg + tmp
+                    self.message.emit(output)
 
-                with open("log.csv", 'a', encoding='utf-8') as f:
-                    f.write('\n' + str(msgSize) + ',' + str(transmitTime))
-                print(output)
+                    with open("log.csv", 'a', encoding='utf-8') as f:
+                        f.write('\n' + str(msgSize) + ',' + str(transmitTime))
+                except bson.errors.InvalidBSON :
+                    print("Bad message")
+                    self.message.emit(str(data))
 
     def stop(self):
         self.terminate()
@@ -68,15 +72,20 @@ class SenderWorker(QtCore.QThread):
                   "timestamp": timeValue,
                   "messageSize": msgSize
                   }
+        buffer = bson.encode(output)
 
         while n <= self.repeat:
-            buffer = bson.encode(output)
             percentage = int(n/self.repeat * 100)
             print(percentage)
             self.statusSignal.emit(percentage)
-            self.txRxObj.write(buffer)
+
+            if self.timeStampEnabled == "disabled":
+                transmittedData  = self.message + "*$*" + str(timeValue)
+                self.txRxObj.write(bytes(transmittedData,'utf-8'))
+            else:
+                self.txRxObj.write(buffer)
             n += 1
-            time.sleep(1)
+            # time.sleep(0.05)
             # self.txRxObj.write(bytes('', 'utf-8'))
 
         self.any_signal.emit(True)
@@ -120,13 +129,17 @@ class ImageReceiverWorker(QtCore.QThread):
         while True:
             val = self.receiver.readall()
             if val:
-                image = Image.open(io.BytesIO(val))
-                imgFormat = image.format
-                filename = "receivedImage" + "." + imgFormat
-                image.save(filename)
-                self.done.emit(True)
-                self.fname.emit(filename)
-                print(val)
+
+                try:
+                    image = Image.open(io.BytesIO(val))
+                    imgFormat = image.format
+                    filename = "receivedImage" + "." + imgFormat
+                    image.save(filename)
+                    self.done.emit(True)
+                    self.fname.emit(filename)
+                    print(val)
+                except:
+                    print("Failed to reproduce image")
 
     def stop(self):
         print("Stopping image receiver thread ...")
@@ -166,6 +179,9 @@ class MainWindow(QMainWindow, mainApp):
 
         # Multithreading
         self.thread = {}
+
+        # Ports
+        self.displayComPorts()
 
     def buttonHandler(self):
         # set the config flag so that the application can only send when initial configuration has been done
@@ -236,23 +252,23 @@ class MainWindow(QMainWindow, mainApp):
         timeStampEnabled = self.timestamps.currentText()
         numberOfRepeats = int(self.repeats.value())
         self.progressBarValue.setMaximum(100)
-        self.thread[1] = SenderWorker(sender=self.txRxObj, message=data, timestamp=timeStampEnabled,
+        self.thread['TextSenderThread'] = SenderWorker(sender=self.txRxObj, message=data, timestamp=timeStampEnabled,
                                       repeat=numberOfRepeats)
-        self.thread[1].start()
+        self.thread['TextSenderThread'].start()
         self.nodeStatus.setText("Mode: Text Tx, Sending")
-        self.thread[1].statusSignal.connect(self.notification)
-        self.thread[1].any_signal.connect(lambda: self.showDialog("information", "Success", "File sent successfully"))
-        self.thread[1].any_signal.connect(lambda: self.nodeStatus.setText("Mode: Text Tx, Done"))
+        self.thread['TextSenderThread'].statusSignal.connect(self.notification)
+        self.thread['TextSenderThread'].any_signal.connect(lambda: self.showDialog("information", "Success", "File sent successfully"))
+        self.thread['TextSenderThread'].any_signal.connect(lambda: self.nodeStatus.setText("Mode: Text Tx, Done"))
 
     def receiveMessage(self):
-        self.thread[2] = ReceiverWorker(receiver=self.txRxObj)
-        self.thread[2].start()
+        self.thread['TextReceiverThread'] = ReceiverWorker(receiver=self.txRxObj)
+        self.thread['TextReceiverThread'].start()
         self.nodeStatus.setText("Mode: Text Rx, Receiving")
-        self.thread[2].message.connect(self.displayReceivedMessage)
+        self.thread['TextReceiverThread'].message.connect(self.displayReceivedMessage)
 
     def notification(self, msg):
         self.progressBarValue.setValue(msg)
-        print("Progress value ",msg)
+        print("Progress value ", msg)
 
     def displayReceivedMessage(self, msg):
         if msg:
@@ -311,7 +327,8 @@ class MainWindow(QMainWindow, mainApp):
         plt.title('Number of Bytes sent vs Transmission time')
         plt.show()
 
-    def createPlotFile(self):
+    @staticmethod
+    def createPlotFile():
         with open('log.csv', 'w') as f:
             f.write('Byte_Size' + ',' + 'Transmission_time')
 
@@ -345,13 +362,13 @@ class MainWindow(QMainWindow, mainApp):
         fname = QFileDialog.getOpenFileName(self, 'Open Image', 'c:\\', "Text files (*.jpg, *.png)")[0]
 
         if fname != '' and MainWindow.connectionFlag:
-            self.thread[3] = ImageWorker(sender=self.txRxObj, path=fname)
-            self.thread[3].start()
+            self.thread['ImageThread'] = ImageWorker(sender=self.txRxObj, path=fname)
+            self.thread['ImageThread'].start()
             self.statusBar().showMessage("Sending", 4000)
             self.nodeStatus.setText("Mode: Image Tx, Sending")
-            self.thread[3].any_signal.connect(
+            self.thread['ImageThread'].any_signal.connect(
                 lambda: self.showDialog("information", "Success", "File sent successfully"))
-            self.thread[3].any_signal.connect(
+            self.thread['ImageThread'].any_signal.connect(
                 lambda: self.nodeStatus.setText("Mode: Image Tx, Done"))
 
         else:
@@ -373,19 +390,19 @@ class MainWindow(QMainWindow, mainApp):
     def receiveImage(self):
         # before listening for messages ensure that the receive image mode was checked, else throw a warning
         if self.imageMode.isChecked():
-            self.thread[4] = ImageReceiverWorker(receiver=self.txRxObj)
-            self.thread[4].start()
+            self.thread['ImageReceiverThread'] = ImageReceiverWorker(receiver=self.txRxObj)
+            self.thread['ImageReceiverThread'].start()
             MainWindow.imageReceiverRunning = True
             self.nodeStatus.setText("Mode: Image Rx, Listening")
-            self.thread[4].fname.connect(self.showImage)
-            self.thread[4].done.connect(self.doneReceiving)
-            self.thread[4].stopped.connect(lambda :self.nodeStatus.setText("Mode: Image Rx, Stopped"))
+            self.thread['ImageReceiverThread'].fname.connect(self.showImage)
+            self.thread['ImageReceiverThread'].done.connect(self.doneReceiving)
+            self.thread['ImageReceiverThread'].stopped.connect(lambda :self.nodeStatus.setText("Mode: Image Rx, Stopped"))
         else:
             MainWindow.showDialog("error", "Warning", "You cannot receive an image in text mode")
 
     def stopListening(self):
         if MainWindow.imageReceiverRunning:
-            self.thread[4].stop()
+            self.thread['ImageReceiverThread'].stop()
             MainWindow.imageReceiverRunning = False
 
     def clearImage(self):
@@ -395,6 +412,13 @@ class MainWindow(QMainWindow, mainApp):
     def doneReceiving(self):
         self.nodeStatus.setText("Mode: Image Rx, Done")
         self.tabWidget.setCurrentIndex(2)
+
+    def displayComPorts(self):
+        ports = serial.tools.list_ports.comports()
+        self.senderPort.clear()
+        for port, _, _ in sorted(ports):
+            self.senderPort.addItem(port)
+
 
 
 def main():
